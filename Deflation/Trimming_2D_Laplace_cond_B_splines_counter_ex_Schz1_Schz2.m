@@ -1,0 +1,230 @@
+% Counter-examples for the additive Schwarz preconditioner 
+% with smooth spline bases.
+
+addpath(genpath('./Precond'))
+addpath(genpath('./Auxiliary functions'))
+addpath(genpath('./Geometry'))
+
+clc
+close all
+clear variables
+
+% Set the parameters
+% polynomial degree
+drange = [3];
+% refinement level
+n_ref = 0;
+% case study
+case_study = 'tips3';
+eps_vec = logspace(-2,-3.5,20);
+
+ne=length(eps_vec);
+nd=length(drange);
+% vector with the smallest volume ratio
+eta_vec = zeros(ne,1);
+% preconditioning techniques
+precond_tech = {'No preconditioning', 'Jacobi', 'SIPIC', 'Schwarz', 'Schwarz'};
+n_prec=length(precond_tech);
+
+% Load default parameters
+T=def_param(precond_tech);
+
+for k=1:n_prec
+    T(k).cond_M=zeros(ne, nd);
+    T(k).cond_K=zeros(ne, nd);
+    T(k).rank=zeros(ne, nd);
+end
+
+id_def=cellfun(@(x) isequal(x,'No preconditioning'), {T.name}, 'UniformOutput', true);
+id_jac=cellfun(@(x) isequal(x,'Jacobi'), {T.name}, 'UniformOutput', true);
+id_sip=cellfun(@(x) isequal(x,'SIPIC'), {T.name}, 'UniformOutput', true);
+id_sch=cellfun(@(x) isequal(x,'Schwarz'), {T.name}, 'UniformOutput', true);
+id_defl=cellfun(@(x) isequal(x,'Deflation'), {T.name}, 'UniformOutput', true);
+
+% Override defaults
+%% Schwarz parameters
+
+sch_cell={' (cut elements)', ' (intersecting supports)'};
+[T(id_sch).addendum]=sch_cell{:};
+T(end-1).color=[0.4 0.7 0.5];
+
+param_schz1.block_sel='cut_elem'; % One index block for each cut element
+param_schz1.inv='approx'; % Approximate inverse for improved stability
+param_schz1.tol=1e-14; % Truncation tolerance
+
+param_schz2=param_schz1;
+param_schz2.block_sel='overlap'; % block index selection based on overlapping basis functions.
+
+T(end-1).param=param_schz1;
+T(end).param=param_schz2;
+
+
+for j = 1:length(drange)
+
+    d = drange(j);
+    fprintf('%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Degree %d %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\n', d);
+
+    [output, square_deg] = feval(case_study,eps_vec,d);
+
+    problem_data.nmnn_sides = [];
+    problem_data.drchlt_sides = [15];
+    problem_data.weak_drchlt_sides = [];
+
+    problem_data.hfun = @(x, y, ind) zeros(size(x));
+
+    method_data.stabilization = false;
+    method_data.stabilization_type = 'physical';
+    method_data.theta = 1e-1;
+    method_data.Nitsche_type = 'symmetric';
+    method_data.Cpen = (d+1)^2*10;
+
+    method_data.nsub       = 2.^[n_ref n_ref];
+    method_data.degree     = [d d];     % Degree of the splines
+    method_data.regularity = [d-1 d-1]; % Regularity of the splines
+    % method_data.regularity = [0 0]; % Regularity of the splines
+    method_data.nquad      = [d+1 d+1];
+
+    % Geometry definition
+    problem_data.geo_name = square_deg;
+
+    for i = 1:ne
+        fprintf('%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Iteration %d %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\n', i);
+
+        method_data.reparam = output{i}(1).trim_srfs(1);
+
+        % Extract the fields from the data structures into local variables
+        data_names = fieldnames (problem_data);
+        for iopt  = 1:numel (data_names)
+            eval ([data_names{iopt} '= problem_data.(data_names{iopt});']);
+        end
+        data_names = fieldnames (method_data);
+        for iopt  = 1:numel (data_names)
+            eval ([data_names{iopt} '= method_data.(data_names{iopt});']);
+        end
+        if ~isfield(problem_data, 'weak_drchlt_sides')
+            weak_drchlt_sides = [];
+        end
+
+        % Construct geometry structure
+        geometry  = geo_load(geo_name);
+        [knots, zeta] = kntrefine (geometry.nurbs.knots, nsub-1, degree, regularity);
+
+        % Number of subdivisions in each parametric direction
+        N=cellfun(@length, zeta, 'UniformOutput', true)-1;
+
+        % Construct msh structure
+        rule     = msh_gauss_nodes (nquad);
+        [qn, qw] = msh_set_quad_nodes (zeta, rule);
+        msh_trimmed = msh_trimming (zeta, qn, qw, geometry, reparam);
+
+        % Construct space structure
+        sp_trimmed = sp_trimming (knots, degree, msh_trimmed);
+
+        M = op_u_v_trimming (sp_trimmed, sp_trimmed, msh_trimmed);
+        K = op_gradu_gradv_trimming (sp_trimmed, sp_trimmed, msh_trimmed);
+
+        % Get the volume of the smallest trimmed element
+        [vol_trim, size_trim] = msh_get_element_size(msh_trimmed);
+        eta_vec(i) = min(vol_trim)/size_trim(1);
+
+        [K,M]=symmetrize(K,M);
+
+        [u_drchlt, drchlt_dofs] = sp_drchlt_l2_proj (sp_trimmed, msh_trimmed, hfun, drchlt_sides);
+        int_dofs = setdiff (1:sp_trimmed.ndof, drchlt_dofs);
+        ndof=sp_trimmed.ndof;
+
+        Kr = K(int_dofs, int_dofs);
+        Mr = M(int_dofs, int_dofs);
+
+        [Kr,Mr]=symmetrize(Kr,Mr);
+
+        sK=0;
+        sM=0;
+
+        %% Preconditioning strategies
+
+        for k=1:n_prec
+            switch precond_tech{k}
+                case 'No preconditioning'
+
+                    T(k).cond_K(i,j)=itcond(Kr,sK);
+                    T(k).cond_M(i,j)=itcond(Mr,sM);
+
+                case 'Jacobi' % Diagonal scaling (Jacobi preconditioning)
+
+                    [Kd,DK]=jacobi(Kr);
+                    [Md,DM]=jacobi(Mr);
+
+                    T(k).cond_K(i,j)=itcond(Kd,sK);
+                    T(k).cond_M(i,j)=itcond(Md,sM);
+
+                case 'SIPIC' % SIPIC preconditioner
+
+                    [Ks]=sipic(Kr);
+                    [Ms]=sipic(Mr);
+
+                    [T(k).cond_K(i,j), T(k).min_mod_K(i,j), T(k).max_mod_K(i,j)]=itcond(Ks,sK);
+                    [T(k).cond_M(i,j), T(k).min_mod_M(i,j), T(k).max_mod_M(i,j)]=itcond(Ms,sM);
+
+                case 'Schwarz' % Schwarz preconditioner
+
+                    [Kz,P1,P2,Pfun]=schwarz(sp_trimmed, msh_trimmed, Kr, int_dofs, T(k).param);
+                    [Mz]=schwarz(sp_trimmed, msh_trimmed, Mr, int_dofs, T(k).param);
+
+                    [T(k).cond_K(i,j), T(k).min_mod_K(i,j), T(k).max_mod_K(i,j)]=itcond(Kz,sK);
+                    [T(k).cond_M(i,j), T(k).min_mod_M(i,j), T(k).max_mod_M(i,j)]=itcond(Mz,sM);
+
+                case 'Deflation' % Deflation based preconditioner
+
+                    [Kp,~,~,~,~,T(k).rank(i,j),~,ilK]=deflation(sp_trimmed, msh_trimmed, Kr, int_dofs, T(k).param);
+                    [Mp,~,~,~,~,~,~,ilM]=deflation(sp_trimmed, msh_trimmed, Mr, int_dofs, T(k).param);
+
+                    T(k).cond_K(i,j)=itcond(Kp(ilK,ilK),sK);
+                    T(k).cond_M(i,j)=itcond(Mp(ilM,ilM),sM);
+
+                otherwise
+                    error('Not implemented')
+            end
+        end
+
+
+    end
+
+end
+
+%% Trimmed geometry
+
+s=1;
+msh_plot_trim_geo(output{s})
+
+%% Plotting results
+
+% Condition number of the (preconditioned) mass
+figure
+for k=1:n_prec
+    loglog(eta_vec, T(k).cond_M, 'Linestyle', 'none', 'Marker', T(k).marker, 'Color',  T(k).color, 'LineWidth', 1, 'DisplayName', [precond_tech{k} T(k).addendum])
+    hold on; grid on;
+end
+trendline(eta_vec, T(id_def).cond_M, color=T(id_def).color, linestyle='-', linewidth=0.5, variable='\eta', subset=true)
+trendline(eta_vec, T(id_jac).cond_M, color=T(id_jac).color, linestyle='-', linewidth=0.5, variable='\eta', subset=true)
+trendline(eta_vec, T(end).cond_M, color=T(end).color, linestyle='-', linewidth=0.5, variable='\eta', subset=true)
+title('Conditioning - $M$')
+legend('Location', 'northeast')
+legend show
+xlabel('$\eta$')
+ylabel('$\kappa$')
+
+% Condition number of the (preconditioned) stiffness
+figure
+for k=1:n_prec
+    loglog(eta_vec, T(k).cond_K, 'Linestyle', 'none', 'Marker', T(k).marker, 'Color',  T(k).color, 'LineWidth', 1, 'DisplayName', [precond_tech{k} T(k).addendum])
+    hold on; grid on;
+end
+trendline(eta_vec, T(id_def).cond_K, color=T(id_def).color, linestyle='-', linewidth=0.5, variable='\eta', subset=true)
+trendline(eta_vec, T(id_jac).cond_K, color=T(id_jac).color, linestyle='-', linewidth=0.5, variable='\eta', subset=true)
+trendline(eta_vec, T(end).cond_K, color=T(end).color, linestyle='-', linewidth=0.5, variable='\eta', subset=true)
+title('Conditioning - $K$')
+legend('Location', 'northeast')
+legend show
+xlabel('$\eta$')
+ylabel('$\kappa$')
