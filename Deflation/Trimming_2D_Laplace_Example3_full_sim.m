@@ -1,4 +1,4 @@
-% Wave equation on a waveguide-inspired spiky structure.
+% Experiment 3: Wave equation on a waveguide-inspired spiky structure.
 % Complete simulation.
 
 addpath(genpath('./Precond'))
