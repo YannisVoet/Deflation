@@ -1,4 +1,4 @@
-% Wave equation on a waveguide-inspired spiky structure.
+% Experiment 3: Wave equation on a waveguide-inspired spiky structure.
 % Simulation of the first time step of an implicit solver.
 % Performance comparison of various preconditioning strategies.
 
